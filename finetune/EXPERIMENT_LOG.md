@@ -1,14 +1,15 @@
 # Experiment Log
 
-## 2026-02-28: Full AVQA Reasoning LoRA Run (8 GPU, 1 Epoch)
+## 2026-02-28: Full AVQA Reasoning LoRA Run (8 GPU, 1 Epoch, 8 Frames)
 
-- Status: running
+- Status: completed
 - Slurm job: `325783`
 - Node: `mlcbm004`
 - Slurm log: `/weka/kuehne/kqr867/code/MiniCPM-o/slurm-325783.out`
 - Output directory: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/output/output_minicpmo45_av_lora_reasoning_full_8gpu_1epoch_video`
 - W&B project: `https://wandb.ai/edsonroteia/minicpm-av`
 - W&B run: `https://wandb.ai/edsonroteia/minicpm-av/runs/89nbh5xy`
+- Final metrics: `train_runtime=1639.9767s`, `train_steps_per_second=0.349`, `train_samples_per_second=11.161`, `train_loss=1.2134307647918487`, `final_eval_loss=1.1241484880447388`
 
 Dataset:
 - Train manifest: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/sample_data/av_reasoning_full_video/train.json`
@@ -51,6 +52,34 @@ Trainable parameters in this setup:
 - `embed_tokens`
 - `resampler`
 - `audio_projection_layer`
+
+## 2026-02-28: Full AVQA Reasoning LoRA Run (8 GPU, 1 Epoch, 16 Frames)
+
+- Status: submitted, pending on `mlcbm005`
+- Slurm job: `325786`
+- Requested node: `mlcbm005`
+- Slurm log: `/weka/kuehne/kqr867/code/MiniCPM-o/slurm-325786.out`
+- Output directory: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/output/output_minicpmo45_av_lora_reasoning_full_16f_8gpu_1epoch_video`
+- W&B project: `https://wandb.ai/edsonroteia/minicpm-av`
+- W&B run: pending until the job starts
+
+Dataset:
+- Train manifest: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/sample_data/av_reasoning_full_video_16f/train.json`
+- Eval manifest: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/sample_data/av_reasoning_full_video_16f/eval.json`
+- Train samples: `18,279`
+- Eval samples: `945`
+- Modality format: 16 video frames decoded on the fly from each `.mp4` via `decord`, plus paired audio loaded from the `.wav`
+- Target: `solution` field from the HumanOmniV2 reasoning dataset
+
+Training configuration:
+- Same as the completed 8-frame full run above, except the prompts request `16` frames instead of `8`
+- GPUs: `8`
+- Effective global batch size: `32`
+- `max_steps`: `572` (about 1 epoch)
+- `dataloader_num_workers`: `4`
+
+Scheduler note:
+- `mlcbm005` is currently occupied by job `325719` (`sft-minicpm-af3kimivl`), so this new run is queued and will start automatically once the node is free
 
 ## 2026-02-28: Reasoning Smoke Benchmark
 
