@@ -164,6 +164,8 @@ def build_reasoning_target(record: dict) -> str:
 
 
 def load_avqa_records(metadata_path: Path, limit: int) -> list:
+    limit = None if limit is None or limit <= 0 else limit
+
     if metadata_path.suffix == ".data":
         records = []
         with open(metadata_path, "r") as handle:
@@ -172,13 +174,13 @@ def load_avqa_records(metadata_path: Path, limit: int) -> list:
                 if not line:
                     continue
                 records.append(json.loads(line))
-                if len(records) >= limit:
+                if limit is not None and len(records) >= limit:
                     break
         return records
 
     with open(metadata_path, "r") as handle:
         records = json.load(handle)
-    return records[:limit]
+    return records if limit is None else records[:limit]
 
 
 def resolve_avqa_video_path(avqa_root: Path, record: dict) -> Path:
@@ -269,6 +271,7 @@ def prepare_from_reasoning(
     count: int,
     eval_count: int,
     num_frames: int,
+    use_video_paths: bool = False,
 ) -> tuple:
     train_records = load_avqa_records(train_metadata_path, count)
     eval_records = load_avqa_records(val_metadata_path, eval_count)
@@ -278,34 +281,36 @@ def prepare_from_reasoning(
         for idx, record in enumerate(records):
             audio_path = normalize_existing_path(record["audio_path"])
             video_path = resolve_reasoning_video_path(avqa_root, record)
-            frame_paths = extract_evenly_spaced_frames(
-                video_path,
-                output_dir,
-                f"{split_name}_{idx:03d}",
-                num_frames,
-            )
             placeholders = build_image_placeholders(num_frames)
             sample_id = record.get("avqa_id", record.get("id", idx))
-            samples.append(
-                {
-                    "id": str(sample_id),
-                    "image": {
-                        placeholder: str(frame_path.resolve())
-                        for placeholder, frame_path in zip(placeholders, frame_paths)
+            sample = {
+                "id": str(sample_id),
+                "audio": str(audio_path.resolve()),
+                "conversations": [
+                    {
+                        "role": "user",
+                        "content": build_reasoning_prompt(record, num_frames),
                     },
-                    "audio": str(audio_path.resolve()),
-                    "conversations": [
-                        {
-                            "role": "user",
-                            "content": build_reasoning_prompt(record, num_frames),
-                        },
-                        {
-                            "role": "assistant",
-                            "content": build_reasoning_target(record),
-                        },
-                    ],
+                    {
+                        "role": "assistant",
+                        "content": build_reasoning_target(record),
+                    },
+                ],
+            }
+            if use_video_paths:
+                sample["video"] = str(video_path.resolve())
+            else:
+                frame_paths = extract_evenly_spaced_frames(
+                    video_path,
+                    output_dir,
+                    f"{split_name}_{idx:03d}",
+                    num_frames,
+                )
+                sample["image"] = {
+                    placeholder: str(frame_path.resolve())
+                    for placeholder, frame_path in zip(placeholders, frame_paths)
                 }
-            )
+            samples.append(sample)
         return samples
 
     train_samples = convert_records(train_records, "reasoning_train")
@@ -381,6 +386,11 @@ def main():
         help="Number of frames to extract per sample.",
     )
     parser.add_argument(
+        "--use-video-paths",
+        action="store_true",
+        help="Store video paths in the dataset and decode frames at training time instead of pre-extracting JPEGs.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -425,6 +435,7 @@ def main():
             args.count,
             args.eval_count,
             args.num_frames,
+            args.use_video_paths,
         )
     else:
         try:

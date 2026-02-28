@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 IMAGE_MARKUP = "<image>./</image>"
 AUDIO_MARKUP = "<audio>./</audio>"
+IMAGE_PLACEHOLDER_RE = re.compile(r"<image(?:_\d+)?>")
 PATH_REWRITES = (
     ("/mnt/lustre/work", "/weka"),
     ("/home/kuehne", "/weka/kuehne"),
@@ -239,6 +240,55 @@ class AVSupervisedDataset(Dataset):
             return self._prepare_multi_image(image_spec, conversations)
         raise TypeError(f"Unsupported image spec type: {type(image_spec)!r}")
 
+    def _load_video_frames(self, video_path: str, num_frames: int) -> List[Image.Image]:
+        if num_frames < 1:
+            raise ValueError("num_frames must be >= 1")
+
+        try:
+            from decord import VideoReader, cpu
+        except ImportError as exc:
+            raise ImportError(
+                "decord is required to load video samples. Use the minicpm env or pre-extract frames."
+            ) from exc
+
+        video_reader = VideoReader(str(_resolve_media_path(video_path)), ctx=cpu(0))
+        total_frames = len(video_reader)
+        if total_frames < 1:
+            raise ValueError(f"Video contains no frames: {video_path}")
+
+        if total_frames == 1:
+            frame_indices = [0] * num_frames
+        else:
+            frame_indices = [
+                int(round((idx + 1) * (total_frames - 1) / (num_frames + 1)))
+                for idx in range(num_frames)
+            ]
+
+        frames = video_reader.get_batch(frame_indices).asnumpy()
+        return [Image.fromarray(frame).convert("RGB") for frame in frames]
+
+    def _prepare_video(
+        self,
+        video_spec: Optional[str],
+        conversations: List[Dict[str, str]],
+    ) -> Optional[List[Image.Image]]:
+        if video_spec is None:
+            return None
+        if not isinstance(video_spec, str):
+            raise TypeError(f"Unsupported video spec type: {type(video_spec)!r}")
+
+        frame_count = 0
+        for message in conversations:
+            content = message.get("content", "")
+            frame_count += len(IMAGE_PLACEHOLDER_RE.findall(content))
+            message["content"] = IMAGE_PLACEHOLDER_RE.sub(IMAGE_MARKUP, content)
+
+        if frame_count == 0:
+            frame_count = 1
+            _prepend_to_first_user(conversations, IMAGE_MARKUP)
+
+        return self._load_video_frames(video_spec, frame_count)
+
     def _prepare_audio(
         self,
         audio_spec: Optional[str],
@@ -269,7 +319,12 @@ class AVSupervisedDataset(Dataset):
         if conversations[0]["role"] != "user":
             raise ValueError("the first role must be user")
 
+        if sample.get("image") is not None and sample.get("video") is not None:
+            raise ValueError("Samples must use either image or video, not both.")
+
         images = self._prepare_images(sample.get("image"), conversations)
+        if images is None:
+            images = self._prepare_video(sample.get("video"), conversations)
         audios = self._prepare_audio(sample.get("audio"), conversations)
         return conversations, images, audios
 
