@@ -55,10 +55,10 @@ Trainable parameters in this setup:
 
 ## 2026-02-28: Full AVQA Reasoning LoRA Run (8 GPU, 1 Epoch, 16 Frames)
 
-- Status: submitted, pending on `mlcbm005`
-- Slurm job: `325786`
+- Status: running
+- Slurm job: `325789`
 - Requested node: `mlcbm005`
-- Slurm log: `/weka/kuehne/kqr867/code/MiniCPM-o/slurm-325786.out`
+- Slurm log: `/weka/kuehne/kqr867/code/MiniCPM-o/slurm-325789.out`
 - Output directory: `/weka/kuehne/kqr867/code/MiniCPM-o/finetune/output/output_minicpmo45_av_lora_reasoning_full_16f_8gpu_1epoch_video`
 - W&B project: `https://wandb.ai/edsonroteia/minicpm-av`
 - W&B run: pending until the job starts
@@ -79,7 +79,8 @@ Training configuration:
 - `dataloader_num_workers`: `4`
 
 Scheduler note:
-- `mlcbm005` is currently occupied by job `325719` (`sft-minicpm-af3kimivl`), so this new run is queued and will start automatically once the node is free
+- Initial submission `325786` was canceled after it remained pending with reason `BeginTime`
+- Resubmission `325789` started immediately on `mlcbm005`
 
 ## 2026-02-28: Reasoning Smoke Benchmark
 
