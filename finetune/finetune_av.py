@@ -1,15 +1,16 @@
 import json
 import logging
 import os
+from importlib.util import find_spec
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from types import MethodType
 
 import torch
 import transformers
 from accelerate.utils import DistributedType
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoModel, AutoProcessor, TrainerCallback
 from transformers.integrations import deepspeed
 
 from dataset_av import AVSupervisedDataset, av_data_collator
@@ -44,6 +45,10 @@ class TrainingArguments(transformers.TrainingArguments):
     llm_type: str = field(default="qwen")
     use_lora: Optional[bool] = field(default=True)
     max_slice_nums: Optional[int] = field(default=1)
+    wandb_num_eval_examples: int = field(
+        default=2,
+        metadata={"help": "Number of evaluation examples to log to W&B as prediction traces."},
+    )
 
 
 @dataclass
@@ -62,6 +67,7 @@ class LoraArguments:
 
 
 local_rank = 0
+logger = logging.getLogger(__name__)
 
 
 def rank0_print(*args):
@@ -117,6 +123,168 @@ def make_supervised_data_module(processor, tokenizer, data_args, max_length=4096
         "eval_dataset": eval_dataset,
         "data_collator": partial(av_data_collator, max_length=max_length),
     }
+
+
+def report_to_includes(report_to: Any, target: str) -> bool:
+    if report_to is None:
+        return False
+    if isinstance(report_to, str):
+        values = [value.strip() for value in report_to.split(",") if value.strip()]
+        return target in values
+    if isinstance(report_to, (list, tuple, set)):
+        return target in report_to
+    return False
+
+
+class WandbPredictionLoggerCallback(TrainerCallback):
+    """Logs teacher-forced prediction traces to W&B after evaluation."""
+
+    def __init__(self, dataset, data_collator, tokenizer, use_lora: bool, num_examples: int = 2):
+        self.dataset = dataset
+        self.data_collator = data_collator
+        self.tokenizer = tokenizer
+        self.use_lora = use_lora
+        self.num_examples = max(0, num_examples)
+        self._wandb = None
+
+    def _get_wandb(self):
+        if self._wandb is not None:
+            return self._wandb
+
+        if find_spec("wandb") is None:
+            logger.warning("W&B example logging requested, but wandb is not installed.")
+            self._wandb = False
+            return None
+
+        import wandb
+
+        self._wandb = wandb
+        return wandb
+
+    def _move_to_device(self, value, device):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, list):
+            return [self._move_to_device(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._move_to_device(item, device) for item in value)
+        if isinstance(value, dict):
+            return {key: self._move_to_device(item, device) for key, item in value.items()}
+        return value
+
+    def _unwrap_model(self, model):
+        return model.module if hasattr(model, "module") else model
+
+    def _run_forward(self, model, batch):
+        model_inputs = dict(batch)
+        model_inputs.pop("labels", None)
+
+        if self.use_lora:
+            with model._enable_peft_forward_hooks(**model_inputs):
+                return model.base_model(data=model_inputs, use_cache=False)
+        return model(data=model_inputs, use_cache=False)
+
+    def _decode_prediction(self, logits: torch.Tensor, labels: torch.Tensor) -> str:
+        mask = labels != -100
+        if not torch.any(mask):
+            return ""
+
+        pred_ids = logits[mask].argmax(dim=-1)
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None:
+            eos_positions = (pred_ids == eos_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                pred_ids = pred_ids[: int(eos_positions[0].item())]
+
+        decoded = self.tokenizer.decode(pred_ids.tolist(), skip_special_tokens=False)
+        return decoded.strip()
+
+    def _build_prompt_text(self, sample: Dict[str, Any]) -> str:
+        parts = []
+        for message in sample.get("conversations", []):
+            if message.get("role") == "user":
+                parts.append(message.get("content", ""))
+        return "\n\n".join(part for part in parts if part)
+
+    def _log_prediction_examples(self, args, state, model):
+        if self.num_examples <= 0:
+            return
+        if not state.is_world_process_zero:
+            return
+        if self.dataset is None or len(self.dataset) == 0:
+            return
+
+        wandb = self._get_wandb()
+        if not wandb or getattr(wandb, "run", None) is None:
+            return
+
+        unwrapped_model = self._unwrap_model(model)
+        try:
+            device = next(unwrapped_model.parameters()).device
+        except StopIteration:
+            return
+
+        table = wandb.Table(
+            columns=[
+                "global_step",
+                "sample_id",
+                "num_frames",
+                "prompt",
+                "target",
+                "prediction",
+                "audio_path",
+            ]
+        )
+
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                for idx in range(min(self.num_examples, len(self.dataset))):
+                    raw_sample = self.dataset.raw_data[idx]
+                    example = self.dataset[idx]
+                    batch = self.data_collator([example])
+                    labels = batch["labels"][0].detach().cpu()
+                    batch = self._move_to_device(batch, device)
+                    outputs = self._run_forward(unwrapped_model, batch)
+                    prediction = self._decode_prediction(outputs.logits[0].detach().cpu(), labels)
+
+                    image_spec = raw_sample.get("image")
+                    if isinstance(image_spec, dict):
+                        num_frames = len(image_spec)
+                    elif image_spec:
+                        num_frames = 1
+                    else:
+                        num_frames = 0
+
+                    target = ""
+                    for message in raw_sample.get("conversations", []):
+                        if message.get("role") == "assistant":
+                            target = message.get("content", "")
+                            break
+
+                    table.add_data(
+                        state.global_step,
+                        raw_sample.get("id", idx),
+                        num_frames,
+                        self._build_prompt_text(raw_sample),
+                        target,
+                        prediction,
+                        raw_sample.get("audio", ""),
+                    )
+        except Exception:
+            logger.exception("Failed to log W&B prediction traces.")
+            return
+        finally:
+            if was_training:
+                model.train()
+
+        wandb.log({"eval/prediction_examples": table})
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._log_prediction_examples(args, state, model)
+        return control
 
 
 def train():
@@ -213,11 +381,24 @@ def train():
         max_slice_nums=training_args.max_slice_nums,
     )
 
+    callbacks = []
+    if report_to_includes(training_args.report_to, "wandb"):
+        callbacks.append(
+            WandbPredictionLoggerCallback(
+                dataset=data_module["eval_dataset"] or data_module["train_dataset"],
+                data_collator=data_module["data_collator"],
+                tokenizer=tokenizer,
+                use_lora=bool(training_args.use_lora),
+                num_examples=training_args.wandb_num_eval_examples,
+            )
+        )
+
     training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
     trainer = CPMTrainer(
         model=model,
         tokenizer=processor,
         args=training_args,
+        callbacks=callbacks,
         **data_module,
     )
 

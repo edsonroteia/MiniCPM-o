@@ -19,6 +19,9 @@ LLM_TYPE=${LLM_TYPE:-qwen}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
 OUTPUT_DIR=${OUTPUT_DIR:-output/output_minicpmo45_av_lora}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
+REPORT_TO=${REPORT_TO:-none}
+RUN_NAME=${RUN_NAME:-}
+WANDB_NUM_EVAL_EXAMPLES=${WANDB_NUM_EVAL_EXAMPLES:-2}
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -31,6 +34,9 @@ DISTRIBUTED_ARGS="
 EXTRA_ARGS=()
 if [ -n "$DEEPSPEED_CONFIG" ]; then
     EXTRA_ARGS+=(--deepspeed "$DEEPSPEED_CONFIG")
+fi
+if [ -n "$RUN_NAME" ]; then
+    EXTRA_ARGS+=(--run_name "$RUN_NAME")
 fi
 
 $TORCHRUN_BIN $DISTRIBUTED_ARGS finetune_av.py \
@@ -73,5 +79,6 @@ $TORCHRUN_BIN $DISTRIBUTED_ARGS finetune_av.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --gradient_checkpointing true \
+    --wandb_num_eval_examples "$WANDB_NUM_EVAL_EXAMPLES" \
     "${EXTRA_ARGS[@]}" \
-    --report_to "none"
+    --report_to "$REPORT_TO"

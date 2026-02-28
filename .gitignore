@@ -6,3 +6,4 @@ slurm-*.out
 finetune/slurm-*.out
 finetune/output/
 finetune/sample_data/
+finetune/wandb/
