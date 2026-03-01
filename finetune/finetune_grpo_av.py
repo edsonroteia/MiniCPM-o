@@ -1,10 +1,12 @@
+import json
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
 import torch
 import transformers
-from peft import PeftModel
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModel, AutoProcessor
 from trl import GRPOConfig
 
@@ -24,6 +26,7 @@ class ModelArguments:
             "output_minicpmo45_av_lora_reasoning_full_8gpu_1epoch_video"
         )
     )
+    merge_sft_adapter: bool = field(default=True)
 
 
 @dataclass
@@ -102,6 +105,20 @@ def resolve_scale_rewards(loss_type: str, scale_rewards: str) -> str:
     raise ValueError("This minimal GRPO path supports only loss_type=dapo or loss_type=dr_grpo.")
 
 
+def load_rl_lora_config(sft_adapter_path: str) -> LoraConfig:
+    config_path = Path(sft_adapter_path) / "adapter_config.json"
+    config = json.loads(config_path.read_text())
+    return LoraConfig(
+        r=config["r"],
+        lora_alpha=config["lora_alpha"],
+        target_modules=config["target_modules"],
+        lora_dropout=config["lora_dropout"],
+        bias=config.get("bias", "none"),
+        layers_to_transform=config.get("layers_to_transform"),
+        modules_to_save=config.get("modules_to_save"),
+    )
+
+
 def train():
     global local_rank
 
@@ -137,7 +154,18 @@ def train():
         model_args.base_model_name_or_path,
         trust_remote_code=True,
     )
-    model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=True)
+    if model_args.merge_sft_adapter:
+        rank0_print("Merging the SFT LoRA adapter into the base model and attaching a fresh RL LoRA adapter.")
+        sft_model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=False)
+        model = sft_model.merge_and_unload()
+        if hasattr(model, "peft_config"):
+            delattr(model, "peft_config")
+        for param in model.parameters():
+            param.requires_grad = False
+        model = get_peft_model(model, load_rl_lora_config(model_args.sft_adapter_path))
+    else:
+        rank0_print("Continuing training directly on the existing SFT LoRA adapter.")
+        model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=True)
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
