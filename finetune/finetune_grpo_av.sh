@@ -50,6 +50,8 @@ LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-cosine}
 BETA=${BETA:-0.04}
 TEMPERATURE=${TEMPERATURE:-1.0}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
+USE_LORA_FOR_RL=${USE_LORA_FOR_RL:-true}
+MERGE_SFT_ADAPTER=${MERGE_SFT_ADAPTER:-true}
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -86,6 +88,8 @@ fi
 $TORCHRUN_BIN $DISTRIBUTED_ARGS finetune_grpo_av.py \
     --base_model_name_or_path "$MODEL" \
     --sft_adapter_path "$SFT_ADAPTER" \
+    --use_lora_for_rl "$USE_LORA_FOR_RL" \
+    --merge_sft_adapter "$MERGE_SFT_ADAPTER" \
     --data_path "$DATA" \
     --max_samples "$MAX_SAMPLES" \
     --num_video_frames "$NUM_VIDEO_FRAMES" \

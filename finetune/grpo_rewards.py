@@ -156,7 +156,7 @@ def format_reward(completions, **kwargs):
     rewards = []
 
     strict_pattern = re.compile(
-        r"\s*<think>.*?</think>\s*<answer>\s*([A-D])\s*</answer>\s*\Z",
+        r"\s*<think>.*?</think>\s*<answer>\s*(.+?)\s*</answer>\s*\Z",
         re.DOTALL | re.IGNORECASE,
     )
     answer_span_pattern = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
@@ -192,7 +192,7 @@ def format_reward(completions, **kwargs):
 
         if len(answer_spans) == 1:
             answer_text = answer_spans[0].group(1).strip()
-            reward += 0.15 if _extract_letter_answer(answer_text) is not None else 0.05
+            reward += 0.15 if answer_text else 0.05
         elif len(answer_spans) > 1:
             if any(_extract_letter_answer(match.group(1).strip()) is not None for match in answer_spans):
                 reward += 0.05
@@ -242,8 +242,8 @@ def resolve_reward_functions(names: str) -> Tuple[List[Callable[..., List[float]
 
     if "accuracy" in reward_names:
         num_other_rewards = len(reward_names) - 1
-        other_weight = 0.1 / num_other_rewards if num_other_rewards > 0 else 0.0
-        reward_weights = [0.9 if name == "accuracy" else other_weight for name in reward_names]
+        other_weight = 0.2 / num_other_rewards if num_other_rewards > 0 else 0.0
+        reward_weights = [0.8 if name == "accuracy" else other_weight for name in reward_names]
     else:
         equal_weight = 1.0 / len(reward_names)
         reward_weights = [equal_weight] * len(reward_names)

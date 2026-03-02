@@ -27,6 +27,7 @@ class ModelArguments:
         )
     )
     merge_sft_adapter: bool = field(default=True)
+    use_lora_for_rl: bool = field(default=True)
 
 
 @dataclass
@@ -140,32 +141,49 @@ def train():
     local_rank = training_args.local_rank
 
     rank0_print(
-        f"Loading policy base={model_args.base_model_name_or_path} adapter={model_args.sft_adapter_path}"
+        f"Loading policy base={model_args.base_model_name_or_path} adapter={model_args.sft_adapter_path} "
+        f"use_lora_for_rl={model_args.use_lora_for_rl}"
     )
-    base_model = AutoModel.from_pretrained(
-        model_args.base_model_name_or_path,
-        trust_remote_code=True,
-        torch_dtype=compute_dtype,
-        init_vision=True,
-        init_audio=True,
-        init_tts=False,
-    )
-    processor = AutoProcessor.from_pretrained(
-        model_args.base_model_name_or_path,
-        trust_remote_code=True,
-    )
-    if model_args.merge_sft_adapter:
-        rank0_print("Merging the SFT LoRA adapter into the base model and attaching a fresh RL LoRA adapter.")
-        sft_model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=False)
-        model = sft_model.merge_and_unload()
-        if hasattr(model, "peft_config"):
-            delattr(model, "peft_config")
-        for param in model.parameters():
-            param.requires_grad = False
-        model = get_peft_model(model, load_rl_lora_config(model_args.sft_adapter_path))
+
+    if model_args.use_lora_for_rl:
+        base_model = AutoModel.from_pretrained(
+            model_args.base_model_name_or_path,
+            trust_remote_code=True,
+            torch_dtype=compute_dtype,
+            init_vision=True,
+            init_audio=True,
+            init_tts=False,
+        )
+        processor = AutoProcessor.from_pretrained(
+            model_args.base_model_name_or_path,
+            trust_remote_code=True,
+        )
+        if model_args.merge_sft_adapter:
+            rank0_print("Merging the SFT LoRA adapter into the base model and attaching a fresh RL LoRA adapter.")
+            sft_model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=False)
+            model = sft_model.merge_and_unload()
+            if hasattr(model, "peft_config"):
+                delattr(model, "peft_config")
+            for param in model.parameters():
+                param.requires_grad = False
+            model = get_peft_model(model, load_rl_lora_config(model_args.sft_adapter_path))
+        else:
+            rank0_print("Continuing training directly on the existing SFT LoRA adapter.")
+            model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=True)
     else:
-        rank0_print("Continuing training directly on the existing SFT LoRA adapter.")
-        model = PeftModel.from_pretrained(base_model, model_args.sft_adapter_path, is_trainable=True)
+        rank0_print("Full fine-tuning: loading SFT checkpoint directly (no LoRA).")
+        model = AutoModel.from_pretrained(
+            model_args.sft_adapter_path,
+            trust_remote_code=True,
+            torch_dtype=compute_dtype,
+            init_vision=True,
+            init_audio=True,
+            init_tts=False,
+        )
+        processor = AutoProcessor.from_pretrained(
+            model_args.sft_adapter_path,
+            trust_remote_code=True,
+        )
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 

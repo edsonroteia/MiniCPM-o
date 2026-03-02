@@ -215,16 +215,7 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
         ]
         self._signature_columns = list(dict.fromkeys((self._signature_columns or []) + extra_columns))
         self._trace_log_limit = max(1, int(getattr(self.args, "wandb_num_logged_completions", 8)))
-        self._trace_logs = {
-            "sample_id": deque(maxlen=self._trace_log_limit),
-            "prompt": deque(maxlen=self._trace_log_limit),
-            "question": deque(maxlen=self._trace_log_limit),
-            "target": deque(maxlen=self._trace_log_limit),
-            "completion": deque(maxlen=self._trace_log_limit),
-            "weighted_reward": deque(maxlen=self._trace_log_limit),
-            "advantage": deque(maxlen=self._trace_log_limit),
-            "per_reward": deque(maxlen=self._trace_log_limit),
-        }
+        self._trace_rows = deque(maxlen=self._trace_log_limit)
 
     def _move_to_device(self, value, device):
         if torch.is_tensor(value):
@@ -292,24 +283,38 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
             weighted_reward = float(torch.nan_to_num((rewards_per_func[idx] * reward_weights).nansum(), nan=0.0).item())
             advantage = float(advantages[idx].item()) if advantages.ndim == 1 else float(advantages[idx].mean().item())
 
-            self._trace_logs["sample_id"].append(str(inputs[idx].get("sample_id", "")))
-            self._trace_logs["prompt"].append(_build_raw_prompt_text(inputs[idx].get("prompt", [])))
-            self._trace_logs["question"].append(str(inputs[idx].get("question_text", "")))
-            self._trace_logs["target"].append(str(inputs[idx].get("solution", "")))
-            self._trace_logs["completion"].append(completions_text[idx])
-            self._trace_logs["weighted_reward"].append(weighted_reward)
-            self._trace_logs["advantage"].append(advantage)
-            self._trace_logs["per_reward"].append(per_reward)
+            self._trace_rows.append(
+                {
+                    "step": int(self.state.global_step),
+                    "rank": int(self.accelerator.process_index),
+                    "prompt_slot": int(idx),
+                    "sample_id": str(inputs[idx].get("sample_id", "")),
+                    "prompt": _build_raw_prompt_text(inputs[idx].get("prompt", [])),
+                    "question": str(inputs[idx].get("question_text", "")),
+                    "target": str(inputs[idx].get("solution", "")),
+                    "completion": completions_text[idx],
+                    "weighted_reward": weighted_reward,
+                    "advantage": advantage,
+                    "per_reward": per_reward,
+                }
+            )
 
     def _log_wandb_traces(self) -> None:
         report_to = self.args.report_to
-        if not self.accelerator.is_main_process or not report_to:
+        if not report_to:
             return
         if isinstance(report_to, str):
             report_targets = {report_to}
         else:
             report_targets = set(report_to)
-        if "wandb" not in report_targets or not self._trace_logs["completion"]:
+        if "wandb" not in report_targets:
+            return
+
+        local_rows = list(self._trace_rows)
+        gathered_rows = gather_object(local_rows)
+        self._trace_rows.clear()
+
+        if not self.accelerator.is_main_process or not gathered_rows:
             return
 
         try:
@@ -322,6 +327,9 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
 
         columns = [
             "step",
+            "prompt_slot",
+            "rollout_index",
+            "rank",
             "sample_id",
             "prompt",
             "question",
@@ -331,24 +339,33 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
             "advantage",
         ] + [f"reward/{name}" for name in self.reward_func_names]
         data = []
-        for idx in range(len(self._trace_logs["completion"])):
-            row = [
-                self.state.global_step,
-                self._trace_logs["sample_id"][idx],
-                self._trace_logs["prompt"][idx],
-                self._trace_logs["question"][idx],
-                self._trace_logs["target"][idx],
-                self._trace_logs["completion"][idx],
-                self._trace_logs["weighted_reward"][idx],
-                self._trace_logs["advantage"][idx],
+        gathered_rows = sorted(
+            gathered_rows,
+            key=lambda row: (row["step"], row["prompt_slot"], row["rank"], row["sample_id"]),
+        )
+        rollout_index_by_group = {}
+        for trace_row in gathered_rows:
+            group_key = (trace_row["step"], trace_row["prompt_slot"])
+            rollout_index = rollout_index_by_group.get(group_key, 0)
+            rollout_index_by_group[group_key] = rollout_index + 1
+            table_row = [
+                trace_row["step"],
+                trace_row["prompt_slot"],
+                rollout_index,
+                trace_row["rank"],
+                trace_row["sample_id"],
+                trace_row["prompt"],
+                trace_row["question"],
+                trace_row["target"],
+                trace_row["completion"],
+                trace_row["weighted_reward"],
+                trace_row["advantage"],
             ]
             for reward_name in self.reward_func_names:
-                row.append(self._trace_logs["per_reward"][idx].get(reward_name))
-            data.append(row)
+                table_row.append(trace_row["per_reward"].get(reward_name))
+            data.append(table_row)
 
         wandb.log({"grpo_traces": wandb.Table(columns=columns, data=data)})
-        for values in self._trace_logs.values():
-            values.clear()
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         original_print_sample = getattr(trl_grpo_module, "print_prompt_completions_sample", None)
@@ -580,22 +597,32 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
                         spk_bounds=generation_inputs["spk_bounds"],
                     )
                 else:
-                    model = self.accelerator.unwrap_model(self.model)
-                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=batch_size,
-                            pixel_values=generation_inputs["pixel_values"],
-                            tgt_sizes=generation_inputs["tgt_sizes"],
-                            image_bound=generation_inputs["image_bound"],
-                            audio_features=generation_inputs["audio_features"],
-                            audio_feature_lens=generation_inputs["audio_feature_lens"],
-                            audio_bounds=generation_inputs["audio_bounds"],
-                            spk_bounds=generation_inputs["spk_bounds"],
+                    unwrapped_policy = self.accelerator.unwrap_model(self.model)
+                    peft_config = getattr(unwrapped_policy, "peft_config", None)
+                    if peft_config is not None:
+                        with use_adapter(unwrapped_policy, adapter_name="ref" if "ref" in peft_config else None):
+                            ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                                self.model,
+                                prompt_completion_ids,
+                                attention_mask,
+                                logits_to_keep,
+                                batch_size=batch_size,
+                                pixel_values=generation_inputs["pixel_values"],
+                                tgt_sizes=generation_inputs["tgt_sizes"],
+                                image_bound=generation_inputs["image_bound"],
+                                audio_features=generation_inputs["audio_features"],
+                                audio_feature_lens=generation_inputs["audio_feature_lens"],
+                                audio_bounds=generation_inputs["audio_bounds"],
+                                spk_bounds=generation_inputs["spk_bounds"],
+                            )
+                    else:
+                        # Full-FT: no reference model available; skip KL
+                        logger.warning(
+                            "beta=%.4f but no ref_model and no peft_config found. "
+                            "Setting ref_per_token_logps=None (KL will be skipped).",
+                            self.beta,
                         )
+                        ref_per_token_logps = None
             else:
                 ref_per_token_logps = None
 
@@ -766,13 +793,15 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
 
         coef_1 = torch.exp(log_importance_weights)
 
+        per_token_kl = None
         if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-            if self.args.use_bias_correction_kl:
-                per_token_kl = per_token_kl * coef_1
+            ref_per_token_logps = inputs.get("ref_per_token_logps")
+            if ref_per_token_logps is not None:
+                per_token_kl = (
+                    torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                )
+                if self.args.use_bias_correction_kl:
+                    per_token_kl = per_token_kl * coef_1
 
         if self.loss_type == "cispo":
             clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
@@ -801,7 +830,7 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
         if self.use_vllm and self.vllm_importance_sampling_correction:
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
-        if self.beta != 0.0:
+        if self.beta != 0.0 and per_token_kl is not None:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         mode = "train" if self.model.training else "eval"
@@ -834,7 +863,7 @@ class MiniCPMOAVGRPOTrainer(GRPOTrainer):
                 return x.mean()
             return (x * mask).sum() / completion_token_count
 
-        if self.beta != 0.0:
+        if self.beta != 0.0 and per_token_kl is not None:
             mean_kl = masked_batch_mean(per_token_kl)
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
 
